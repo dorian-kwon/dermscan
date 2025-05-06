@@ -5,3 +5,5 @@ tensorflow
 tf-keras
 torch
 accelerate
+openai
+python-dotenv

@@ -1,22 +1,27 @@
-from flask import Flask, request, jsonify, render_template, url_for, redirect
-import os
-import numpy as np
-from PIL import Image
-import tensorflow as tf
-from werkzeug.utils import secure_filename
-import uuid
+import base64
 import json
 import logging
+import os
 import re
 import sqlite3
-from datetime import datetime
+import uuid
+
+import requests
+from flask import Flask, request, jsonify, render_template, url_for, redirect, session
+from werkzeug.utils import secure_filename
 
 from backend.models.swin_model import SwinModel
 from models.vi_model import ViModel
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
 
 app = Flask(__name__)
 
@@ -71,6 +76,13 @@ def init_db():
 
 # 데이터베이스 초기화 실행
 init_db()
+
+# 시크릿 키 설정
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dermscan-secret-key')
+
+# OpenAI API 설정 - 빈 값으로 초기화하고 API를 통해 설정 가능하게 함
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+app.config['OPENAI_API_KEY'] = OPENAI_API_KEY
 
 # 업로드 폴더 설정
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
@@ -179,12 +191,205 @@ def index():
 def admin():
     return render_template('admin.html')
 
+# OpenAI API 키 설정 API
+@app.route('/api/settings/openai', methods=['POST'])
+def update_openai_settings():
+    if request.method == 'POST':
+        try:
+            data = request.json
+            if not data or 'api_key' not in data:
+                return jsonify({'error': 'API 키가 필요합니다'}), 400
+
+            api_key = data['api_key']
+            # API 키 유효성 검사 (간단한 형식 검사만)
+            if not api_key.startswith('sk-') and api_key != '':
+                return jsonify({'error': 'OpenAI API 키 형식이 올바르지 않습니다'}), 400
+
+            # 세션과 앱 설정에 API 키 저장
+            session['openai_api_key'] = api_key
+            app.config['OPENAI_API_KEY'] = api_key
+
+            logger.info("OpenAI API 키가 업데이트되었습니다.")
+            return jsonify({'success': True, 'message': 'API 키가 설정되었습니다'})
+        except Exception as e:
+            logger.error(f"OpenAI API 키 설정 중 오류: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+# 현재 OpenAI API 키 상태 확인 API
+@app.route('/api/settings/openai', methods=['GET'])
+def get_openai_settings():
+    try:
+        # 세션 또는 앱 설정에서 API 키 가져오기
+        api_key = session.get('openai_api_key', app.config.get('OPENAI_API_KEY', ''))
+        
+        # API 키가 설정되어 있는지만 확인 (보안상 키 자체는 반환하지 않음)
+        is_set = bool(api_key)
+        
+        return jsonify({
+            'success': True,
+            'api_key_set': is_set
+        })
+    except Exception as e:
+        logger.error(f"OpenAI API 키 상태 확인 중 오류: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 
 # 404 에러 핸들러 - 커스텀 404 페이지
 @app.errorhandler(404)
 def page_not_found(e):
     return render_template('404.html'), 404
 
+
+# OpenAI API를 사용하여 병변 설명 생성
+def generate_openai_description(image_path, diagnoses, model_used):
+    try:
+        # API 키 확인
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if not api_key:
+            logger.warning("OpenAI API 키가 설정되지 않았습니다. 기본 설명을 반환합니다.")
+            return "이 피부 병변에 대한 자세한 설명을 생성하기 위해 OpenAI API 키가 필요합니다. 관리자에게 문의하세요."
+
+        # 이미지를 base64로 인코딩
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+        # 진단 결과 상위 3개 추출
+        top_diagnoses = diagnoses[:min(3, len(diagnoses))]
+        diagnoses_text = ", ".join([f"{d['diagnosis']} ({int(d['probability']*100)}%)" for d in top_diagnoses])
+        
+        # API 요청 헤더
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        # 최신 모델로 업데이트 (gpt-4-vision-preview가 더 이상 지원되지 않음)
+        # 최신 버전인 gpt-4o 모델 사용
+        model_name = "gpt-4o"
+        
+        # 프롬프트 수정 - 더 일반적인 요청으로 변경
+        system_prompt = "당신은 의학적 설명을 제공하는 유용한 도우미입니다. 이미지와 텍스트 데이터를 바탕으로 교육적이고 유용한 정보를 제공해 주세요."
+        user_prompt = f"""
+이 이미지는 피부 질환의 예시입니다. 이미지에 대한 AI 분석 결과 가능성 있는 진단으로 다음이 제시되었습니다: {diagnoses_text}
+
+이 이미지에 보이는 피부 상태에 대해 다음 사항을 포함하여 간략하게 교육적인 설명을 제공해주세요:
+1. 이미지를 형태와 병변 크기등 이미지가 해당 변병으로 보이는 이유를 상세 안내
+2. 이런 피부 상태의 일반적인 원인
+3. 이러한 상태에 대한 일반적인 접근 방식 
+4. 언제 의사를 방문해야 하는지에 대한 안내
+
+의학적으로 정확하되 이해하기 쉬운 용어를 사용해주세요. 이 설명은 교육적 목적으로만 사용되며, 의학적 조언을 대체하지 않음을 명시해주세요.
+"""
+        
+        # API 요청 본문
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": user_prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 800,
+            "temperature": 0.7
+        }
+
+        # 로그에 요청 정보 추가
+        logger.info(f"OpenAI API 요청: 모델={payload['model']}, 이미지 크기={len(base64_image)}, 진단={diagnoses_text}")
+        
+        # 최신 OpenAI API 엔드포인트
+        api_url = "https://api.openai.com/v1/chat/completions"
+        
+        # API 요청 보내기
+        response = requests.post(api_url, headers=headers, json=payload)
+        
+        # 응답 상태 로깅
+        logger.info(f"OpenAI API 응답 상태 코드: {response.status_code}")
+        
+        # 오류 응답 확인
+        if response.status_code != 200:
+            logger.error(f"OpenAI API 오류: {response.status_code} {response.text}")
+            raise Exception(f"OpenAI API 오류: {response.status_code} {response.text}")
+            
+        response.raise_for_status()  # HTTP 오류 발생 시 예외 발생
+        
+        # 응답에서 텍스트 추출
+        response_data = response.json()
+        
+        # 응답 구조 확인 로깅
+        logger.info(f"OpenAI API 응답 키: {', '.join(response_data.keys())}")
+        
+        # 응답 구조에 따라 다른 처리
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            # 표준 응답 형식
+            if "message" in response_data["choices"][0] and "content" in response_data["choices"][0]["message"]:
+                openai_description = response_data["choices"][0]["message"]["content"].strip()
+            # 대체 응답 형식 (모델에 따라 다를 수 있음)
+            elif "text" in response_data["choices"][0]:
+                openai_description = response_data["choices"][0]["text"].strip()
+            else:
+                logger.error(f"알 수 없는 OpenAI API 응답 형식: {response_data}")
+                raise Exception("알 수 없는 OpenAI API 응답 형식")
+        else:
+            logger.error(f"OpenAI API 응답에 선택지가 없음: {response_data}")
+            raise Exception("OpenAI API 응답에 선택지가 없음")
+        
+        # "I'm sorry, I can't assist with that..." 응답 체크
+        if openai_description.lower().startswith("i'm sorry") or openai_description.lower().startswith("i apologize"):
+            logger.warning(f"OpenAI에서 거부 응답 받음: {openai_description}")
+            # 백업 설명 생성
+            if diagnoses and len(diagnoses) > 0:
+                top_diagnosis = diagnoses[0]['diagnosis']
+                default_description = f"""
+{top_diagnosis}는 피부에 나타나는 상태입니다. 이 유형의 피부 상태는 전문적인 진단과 치료가 필요할 수 있습니다.
+
+일반적으로 이러한 피부 상태는 다양한 원인에 의해 발생할 수 있으며, 적절한 치료를 위해서는 피부과 전문의의 정확한 진단이 중요합니다.
+
+이 설명은 참고용이며, 정확한 진단 및 치료 방법은 반드시 전문 의료인과 상담하시기 바랍니다.
+"""
+                return default_description
+        
+        # 디버그용 로깅 추가
+        logger.info("OpenAI에서 병변 설명 생성 완료")
+        logger.info(f"생성된 설명: {openai_description[:100]}...")  # 처음 100자만 로깅
+        
+        return openai_description
+        
+    except Exception as e:
+        logger.error(f"OpenAI 병변 설명 생성 중 오류: {str(e)}")
+        # 스택 트레이스 로깅
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # 기본 설명 반환
+        if diagnoses and len(diagnoses) > 0:
+            top_diagnosis = diagnoses[0]['diagnosis']
+            return f"""{top_diagnosis}로 의심되는 피부 상태입니다.
+
+이러한 피부 상태는 다양한 원인에 의해 발생할 수 있으며, 적절한 관리가 필요할 수 있습니다.
+
+정확한 진단과 치료 방법은 반드시 피부과 전문의와 상담하시기 바랍니다."""
+        else:
+            return """이 피부 상태에 대한 정확한 분석을 위해서는 피부과 전문의와 상담이 필요합니다.
+
+피부 상태는 개인마다 다르게 나타날 수 있으며, 적절한 진단과 치료를 위해서는 전문가의 검진이 중요합니다.
+
+이 설명은 참고용이며, 의학적 조언을 대체할 수 없습니다."""
 
 # 이미지 업로드 및 분석 API
 @app.route('/api/analyze', methods=['POST'])
@@ -221,25 +426,44 @@ def analyze_image():
             # 이미지 전처리
             processed_image = model.preprocess_image(file_path)
 
-            # 병변 설명 생성
-            description = model.generate_description(processed_image)
-
             # 진단명 예측
             diagnoses = model.predict(processed_image)
+            
+            # 기본 병변 설명 생성
+            default_description = model.generate_description(processed_image)
+            logger.info(f"기본 설명 생성됨: {default_description[:50]}...")
+            
+            # OpenAI 기반 설명 생성 시도
+            openai_description = generate_openai_description(file_path, diagnoses, model_type)
+            
+            # 최종 설명 선택 (OpenAI 설명이 있으면 사용, 없으면 기본 설명 사용)
+            description = openai_description if openai_description else default_description
+            
+            # OpenAI 설명 사용 여부 표시
+            used_openai = openai_description is not None
+            
+            logger.info(f"최종 설명 선택: {'OpenAI' if used_openai else '기본'} 설명 (길이: {len(description)})")
 
-            # 결과 반환
+            # 이미지 URL 생성
+            image_url = url_for('static', filename=f'uploads/{unique_filename}', _external=True)
+            
+            # 결과 JSON 생성
             result = {
-                'image_url': url_for('static', filename=f'uploads/{unique_filename}', _external=True),
+                'image_url': image_url,
                 'description': description,
                 'diagnoses': diagnoses,
-                'model_used': model_type
+                'model_used': model_type,
+                'used_openai': used_openai
             }
+            
+            # 결과 키 확인 로깅
+            logger.info(f"응답 JSON 키: {', '.join(result.keys())}")
+            logger.info(f"설명 타입: {type(description).__name__}, 설명 길이: {len(description)}")
 
             # 분석 로그 저장
             try:
                 # IP 주소 추출
                 ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-                image_path = url_for('static', filename=f'uploads/{unique_filename}', _external=True)
                 diagnoses_json = json.dumps(diagnoses)
                 
                 # 데이터베이스에 저장
@@ -248,21 +472,31 @@ def analyze_image():
                 
                 cursor.execute(
                     'INSERT INTO analysis_log (image_path, model, ip_address, diagnoses) VALUES (?, ?, ?, ?)',
-                    (image_path, model_type, ip_address, diagnoses_json)
+                    (image_url, model_type, ip_address, diagnoses_json)
                 )
                 
                 conn.commit()
                 conn.close()
-                logger.info(f"분석 로그 저장 성공: {image_path}, 모델: {model_type}, IP: {ip_address}")
+                logger.info(f"분석 로그 저장 성공: {image_url}, 모델: {model_type}, IP: {ip_address}")
             except Exception as e:
                 logger.error(f"분석 로그 저장 오류: {str(e)}")
                 # 로그 저장 실패해도 결과는 반환
             
             logger.info(f"이미지 분석 완료: {len(diagnoses)}개 진단 결과, 모델: {model_type}")
-            return jsonify(result)
+            
+            # 최종 JSON 응답
+            response = jsonify(result)
+            
+            # CORS 헤더 추가 (필요한 경우)
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            
+            return response
 
         except Exception as e:
             logger.error(f"이미지 분석 오류: {str(e)}")
+            # 상세 오류 스택트레이스 로깅
+            import traceback
+            logger.error(traceback.format_exc())
             return jsonify({'error': str(e)}), 500
 
     return jsonify({'error': 'File type not allowed'}), 400

@@ -125,3 +125,6 @@ backend/*.log
 # Mac index
 .DS_Store
 *.db
+
+# .env
+.env
